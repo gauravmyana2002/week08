@@ -144,3 +144,5 @@ jobs:
     - name: Logout from Azure
       run: az logout
       if: always()
+
+#to run the it automatically on pushes to the 'main' branch
