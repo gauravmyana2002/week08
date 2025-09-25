@@ -3,30 +3,9 @@ name: CD - Deploy Frontend to AKS
 
 on:
   # auto-trigger after backend workflow finishes
-name: CD - Deploy Frontend to AKS
-
-on:
   workflow_run:
-    types: [completed]            # listen to ANY workflow finishing
-    branches: ["main"]            # only runs when the upstream run was on main
-  workflow_dispatch:
-    inputs: {}                    # keep manual run support
-
-jobs:
-  deploy_frontend:
-    # only run when the upstream workflow SUCCEEDED
-    # and the upstream workflow file is your backend workflow file
-    if: >
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.conclusion == 'success' &&
-          endsWith(github.event.workflow_run.path, '.github/workflows/backend-cd.yml')
-        )
-      }}
-    runs-on: ubuntu-latest
-    environment: Production
+    workflows: ["CD - Deploy Backend Services to AKS"]   # must match backend workflow name exactly
+    types: [completed]
   # manual run still supported
   workflow_dispatch:
     inputs:
