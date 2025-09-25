@@ -1,93 +1,73 @@
-# week08/.github/workflows/frontend-cd.yml
-
+# .github/workflows/frontend-cd.yml
 name: CD - Deploy Frontend to AKS
 
-# This workflow can be called by other workflows and takes inputs.
-# Or it can be run manually if you provide the IPs.
 on:
+  # auto-trigger when backend CD finishes
+  workflow_run:
+    workflows: ["CD - Deploy Backend Services to AKS"]   # must match backend workflow name EXACTLY
+    types: [completed]
+  # optional manual run
   workflow_dispatch:
-    inputs:
-      product_api_ip:
-        description: 'External IP of Product Service'
-        required: true
-        default: 'http://<ip_address>:8000'
-      order_api_ip:
-        description: 'External IP of Order Service (e.g., http://Y.Y.Y.Y:8001)'
-        required: true
-        default: 'http://<ip_address>:8001'
-      aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: '<aks_name>'
-      aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: '<<resource_group_name>'
-
-  workflow_call:
-    inputs:
-      product_api_ip:
-        required: true
-        type: string
-      order_api_ip:
-        required: true
-        type: string
-      aks_cluster_name:
-        required: true
-        type: string
-      aks_resource_group:
-        required: true
-        type: string
 
 jobs:
   deploy_frontend:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     environment: Production
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    env:
+      # set your real K8s Service names + ports
+      PRODUCT_SVC: product-service-w08e1
+      ORDER_SVC:   order-service-w08e1
+      PRODUCT_PORT: "8000"
+      ORDER_PORT:   "8001"
 
-      # Azure login using a Service Principal secret
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Login to Azure Container Registry (ACR)
-      - name: Login to Azure Container Registry
-        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-
-      - name: Inject Backend IPs into Frontend main.js
-        run: |
-          echo "Injecting IPs into frontend/static/js/main.js"
-          # Ensure frontend/main.js is directly in the path for sed
-          sed -i "s|_PRODUCT_API_URL_|${{ inputs.product_api_ip }}|g" frontend/main.js
-          sed -i "s|_ORDER_API_URL_|${{ inputs.order_api_ip }}|g" frontend/main.js
-          
-          # Display the modified file content for debugging
-          echo "--- Modified main.js content ---"
-          cat frontend/main.js
-          echo "---------------------------------"
-
-      # Build and Push Docker image for Frontend
-      - name: Build and Push Frontend Image
-        run: |
-          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest ./frontend/
-          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest
-
-      - name: Set Kubernetes context (get AKS credentials)
+      - name: Set AKS context
         uses: azure/aks-set-context@v3
         with:
-          resource-group: ${{ inputs.aks_resource_group }}
-          cluster-name: ${{ inputs.aks_cluster_name }}
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER }}
 
-      - name: Deploy Frontend to AKS
+      - name: Resolve backend IPs from AKS
+        id: ips
         run: |
-          echo "Deploying frontend with latest tag to AKS cluster: ${{ inputs.aks_cluster_name }}"
-          cd k8s/
-          # Ensure frontend-service.yaml is configured with your ACR
-          kubectl apply -f frontend.yaml
+          get_ip () { kubectl get svc "$1" -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
+          for i in {1..60}; do
+            PROD=$(get_ip "${PRODUCT_SVC}") || true
+            ORD=$(get_ip  "${ORDER_SVC}")  || true
+            if [ -n "$PROD" ] && [ -n "$ORD" ]; then break; fi
+            sleep 5
+          done
+          [ -n "$PROD" ] || { echo "::error::Product IP not found"; exit 1; }
+          [ -n "$ORD" ]  || { echo "::error::Order IP not found"; exit 1; }
+          echo "PRODUCT_IP=$PROD" >> $GITHUB_OUTPUT
+          echo "ORDER_IP=$ORD"   >> $GITHUB_OUTPUT
 
-      - name: Logout from Azure (AKS deployment)
-        run: az logout
+      - name: Inject IPs into frontend/main.js
+        run: |
+          sed -i "s|_PRODUCT_API_URL_|http://${{ steps.ips.outputs.PRODUCT_IP }}:${PRODUCT_PORT}|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ steps.ips.outputs.ORDER_IP }}:${ORDER_PORT}|g"   frontend/main.js
+          echo "--- main.js after injection ---"
+          sed -n '1,200p' frontend/main.js
+
+      - name: ACR login
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Build & push frontend image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }} ./frontend
+          docker push     ${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }}
+
+      - name: Rollout frontend on AKS
+        run: |
+          # adjust deployment/container names if different
+          kubectl set image deployment/frontend frontend=${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }}
+          kubectl rollout status deployment/frontend --timeout=180s
