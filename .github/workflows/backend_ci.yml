@@ -145,4 +145,4 @@ jobs:
       run: az logout
       if: always()
 
-#to run the it automatically on pushes to the 'main' branch
+# to run the it automatically on pushes to the 'main' branch
