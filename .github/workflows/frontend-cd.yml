@@ -2,28 +2,55 @@
 name: CD - Deploy Frontend to AKS
 
 on:
-  # auto-trigger when backend CD finishes
+  # auto-trigger after backend workflow finishes
   workflow_run:
-    workflows: ["CD - Deploy Backend Services to AKS"]   # must match backend workflow name EXACTLY
+    workflows: ["CD - Deploy Backend Services to AKS"]   # must match backend workflow name exactly
     types: [completed]
-  # optional manual run
+  # manual run still supported
   workflow_dispatch:
+    inputs:
+      product_api_ip:
+        description: 'External Product API URL (e.g., http://X.X.X.X:8000)'
+        required: false
+        default: 'http://<ip_address>:8000'
+      order_api_ip:
+        description: 'External Order API URL (e.g., http://Y.Y.Y.Y:8001)'
+        required: false
+        default: 'http://<ip_address>:8001'
+      aks_cluster_name:
+        description: 'AKS cluster (manual runs only)'
+        required: false
+        default: '<aks_name>'
+      aks_resource_group:
+        description: 'AKS resource group (manual runs only)'
+        required: false
+        default: '<resource_group_name>'
+
+  # (optional) callable from other workflows
+  workflow_call:
+    inputs:
+      product_api_ip:      { required: true,  type: string }
+      order_api_ip:        { required: true,  type: string }
+      aks_cluster_name:    { required: true,  type: string }
+      aks_resource_group:  { required: true,  type: string }
 
 jobs:
   deploy_frontend:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # run on successful backend run OR manual/call
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (github.event.workflow_run.conclusion == 'success') }}
     runs-on: ubuntu-latest
     environment: Production
 
     env:
-      # set your real K8s Service names + ports
+      # your real K8s Service names + ports
       PRODUCT_SVC: product-service-w08e1
       ORDER_SVC:   order-service-w08e1
       PRODUCT_PORT: "8000"
       ORDER_PORT:   "8001"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Azure Login
         uses: azure/login@v1
@@ -33,11 +60,25 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v3
         with:
-          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
-          cluster-name:   ${{ secrets.AKS_CLUSTER }}
+          # use inputs for manual runs, secrets for auto-runs
+          resource-group: ${{ github.event_name == 'workflow_dispatch' && inputs.aks_resource_group || secrets.AKS_RESOURCE_GROUP }}
+          cluster-name:   ${{ github.event_name == 'workflow_dispatch' && inputs.aks_cluster_name   || secrets.AKS_CLUSTER }}
 
+      # Prefer manual inputs if provided (and not the placeholder)
+      - name: Use manual API URLs (if provided)
+        id: urls
+        env:
+          P_IN: ${{ inputs.product_api_ip }}
+          O_IN: ${{ inputs.order_api_ip }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.product_api_ip != '' && !contains(inputs.product_api_ip, '<ip_address>') && inputs.order_api_ip != '' && !contains(inputs.order_api_ip, '<ip_address>') }}
+        run: |
+          echo "product_url=${P_IN}" >> $GITHUB_OUTPUT
+          echo "order_url=${O_IN}"   >> $GITHUB_OUTPUT
+
+      # Otherwise resolve live IPs from AKS
       - name: Resolve backend IPs from AKS
-        id: ips
+        id: urls_fallback
+        if: ${{ steps.urls.outputs.product_url == '' || steps.urls.outputs.order_url == '' }}
         run: |
           get_ip () { kubectl get svc "$1" -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
           for i in {1..60}; do
@@ -48,26 +89,46 @@ jobs:
           done
           [ -n "$PROD" ] || { echo "::error::Product IP not found"; exit 1; }
           [ -n "$ORD" ]  || { echo "::error::Order IP not found"; exit 1; }
-          echo "PRODUCT_IP=$PROD" >> $GITHUB_OUTPUT
-          echo "ORDER_IP=$ORD"   >> $GITHUB_OUTPUT
+          echo "product_url=http://${PROD}:${PRODUCT_PORT}" >> $GITHUB_OUTPUT
+          echo "order_url=http://${ORD}:${ORDER_PORT}"     >> $GITHUB_OUTPUT
 
-      - name: Inject IPs into frontend/main.js
+      - name: Finalize URLs
         run: |
-          sed -i "s|_PRODUCT_API_URL_|http://${{ steps.ips.outputs.PRODUCT_IP }}:${PRODUCT_PORT}|g" frontend/main.js
-          sed -i "s|_ORDER_API_URL_|http://${{ steps.ips.outputs.ORDER_IP }}:${ORDER_PORT}|g"   frontend/main.js
-          echo "--- main.js after injection ---"
-          sed -n '1,200p' frontend/main.js
+          P="${{ steps.urls.outputs.product_url }}"
+          O="${{ steps.urls.outputs.order_url }}"
+          [ -z "$P" ] && P="${{ steps.urls_fallback.outputs.product_url }}"
+          [ -z "$O" ] && O="${{ steps.urls_fallback.outputs.order_url }}"
+          echo "::notice:: PRODUCT_URL=$P"
+          echo "::notice:: ORDER_URL=$O"
+          echo "PRODUCT_URL=$P" >> $GITHUB_ENV
+          echo "ORDER_URL=$O"   >> $GITHUB_ENV
 
-      - name: ACR login
-        run: az acr login --name ${{ secrets.ACR_NAME }}
-
-      - name: Build & push frontend image
+      - name: Inject Backend IPs into Frontend main.js
         run: |
-          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }} ./frontend
-          docker push     ${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }}
+          sed -i "s|_PRODUCT_API_URL_|${PRODUCT_URL}|g" week08/frontend/main.js || sed -i "s|_PRODUCT_API_URL_|${PRODUCT_URL}|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|${ORDER_URL}|g"     week08/frontend/main.js || sed -i "s|_ORDER_API_URL_|${ORDER_URL}|g"     frontend/main.js
+          echo "--- main.js (first 60 lines) ---"
+          sed -n '1,60p' week08/frontend/main.js 2>/dev/null || sed -n '1,60p' frontend/main.js
 
-      - name: Rollout frontend on AKS
+      # robust ACR login (works if you store name or login-server in the secret)
+      - name: Login to Azure Container Registry
+        env:
+          ACR: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
         run: |
-          # adjust deployment/container names if different
-          kubectl set image deployment/frontend frontend=${{ secrets.ACR_LOGIN_SERVER }}/frontend:prod-${{ github.run_number }}
-          kubectl rollout status deployment/frontend --timeout=180s
+          NAME="$ACR"
+          NAME="${NAME##https://}"
+          NAME="${NAME%%/*}"
+          NAME="${NAME%%.azurecr.io}"
+          az acr login --name "$NAME"
+
+      # >>> DO NOT CHANGE THESE LINES (as requested) <<<
+      - name: Build and Push Frontend Image
+        run: |
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest ./frontend/
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest
+
+      - name: Deploy Frontend to AKS
+        run: |
+          echo "Deploying frontend (latest) to AKS"
+          cd k8s/
+          kubectl apply -f frontend.yaml
