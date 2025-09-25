@@ -42,6 +42,19 @@ jobs:
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+        # Resolve vars from secrets or workflow_dispatch inputs
+      - name: Resolve AKS/ACR variables
+        run: |
+          [ -n "${{ secrets.AKS_RESOURCE_GROUP }}" ] && echo "AKS_RG=${{ secrets.AKS_RESOURCE_GROUP }}" >> $GITHUB_ENV || echo "AKS_RG=${{ github.event.inputs.aks_resource_group }}" >> $GITHUB_ENV
+          [ -n "${{ secrets.AKS_CLUSTER }}" ]        && echo "AKS_CLUSTER=${{ secrets.AKS_CLUSTER }}" >> $GITHUB_ENV || echo "AKS_CLUSTER=${{ github.event.inputs.aks_cluster_name }}" >> $GITHUB_ENV
+          [ -n "${{ secrets.ACR_NAME }}" ]           && echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV || echo "ACR_NAME=${{ github.event.inputs.aks_acr_name }}" >> $GITHUB_ENV
+
+# Guard: stop if anything is still empty (prevents the exact error you saw)
+      - name: Validate variables
+        run: |
+          echo "::notice:: Using RG=$AKS_RG CLUSTER=$AKS_CLUSTER ACR=$ACR_NAME"
+          [ -n "$AKS_RG" ] || (echo "::error:: AKS_RG is empty"; exit 1)
+          [ -n "$AKS_CLUSTER" ] || (echo "::error:: AKS_CLUSTER is empty"; exit 1)
 
       - name: Set Kubernetes context (get AKS credentials)
         run: az aks get-credentials --resource-group $AKS_RG --name $AKS_CLUSTER --overwrite-existing
